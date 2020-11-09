@@ -29,6 +29,7 @@ import time
 
 from contextlib import contextmanager
 from distutils.version import LooseVersion
+from functools import wraps
 from numbers import Number
 from traceback import format_exc
 
@@ -557,6 +558,66 @@ class AnsibleEnvironment(Environment):
         self.tests = JinjaPluginIntercept(self.tests, test_loader)
 
 
+def templar_template_decorator(method):
+    """
+    Decorator, dedicated to "template" method in Templar.
+    This method has multiple return points, and we want this specific logic for return:
+    If (and only if) we provide "path_to_variable" argument for the method, we want to save
+    it's result to "_known_variables" attribute.
+    This could speed up our templating and will help us find the way out of infinite recursive loop
+    in some special cases (see #8603)
+    """
+    @wraps(method)
+    def _impl(self, *method_args, **method_kwargs):
+        path_to_variable = method_kwargs.get('path_to_variable')
+        if path_to_variable and path_to_variable in self._known_variables:
+            return self._known_variables[path_to_variable]
+        result = method(self, *method_args, **method_kwargs)
+        if path_to_variable:
+            self._known_variables[path_to_variable] = result
+        return result
+    return _impl
+
+
+class KnownVariablesDict(dict):
+    """
+    Special dict for special needs. The idea is simple:
+    dict["variable_root.sub_variable.sub_sub_variable"]
+    transforms into:
+    dict["variable_root"]["sub_variable"]["sub_sub_variable"]
+
+    This will work too:
+    a = dict["variable_root"]["sub_variable"]
+    a = dict["variable_root"]["sub_variable.sub_sub_variable"]
+    a = dict["variable_root"]["sub_variable"]["sub_sub_variable"]
+
+    """
+    @classmethod
+    def from_dict(cls, d):
+        return cls(**d)
+
+    def __setitem__(self, key, value):
+        if isinstance(value, dict):
+            value = self.from_dict(value)
+        if "." in key:
+            subdict_name, subitem = key.split(".", 1)
+            subdict = self.setdefault(subdict_name, KnownVariablesDict())
+            if isinstance(subdict, KnownVariablesDict):
+                self[subdict_name][subitem] = value
+            else:
+                self[subdict_name] = KnownVariablesDict(**{subitem: value})
+
+        else:
+            super(KnownVariablesDict, self).__setitem__(key, value)
+
+    def __getitem__(self, key):
+        if '.' in key:
+            subdict, subitem = key.split(".", 1)
+            return self[subdict][subitem]
+        else:
+            return super(KnownVariablesDict, self).__getitem__(key)
+
+
 class Templar:
     '''
     The main class for templating, with the main entry-point of template().
@@ -569,6 +630,7 @@ class Templar:
         self._filters = None
         self._tests = None
         self._available_variables = variables
+        self._known_variables = KnownVariablesDict()
         self._cached_result = {}
 
         if loader:
@@ -694,6 +756,7 @@ class Templar:
         if not isinstance(variables, Mapping):
             raise AnsibleAssertionError("the type of 'variables' should be a Mapping but was a %s" % (type(variables)))
         self._available_variables = variables
+        self._known_variables = KnownVariablesDict()
         self._cached_result = {}
 
     def set_available_variables(self, variables):
@@ -733,8 +796,9 @@ class Templar:
             obj = mapping.get(key, self.environment)
             setattr(obj, key, original[key])
 
+    @templar_template_decorator
     def template(self, variable, convert_bare=False, preserve_trailing_newlines=True, escape_backslashes=True, fail_on_undefined=None, overrides=None,
-                 convert_data=True, static_vars=None, cache=True, disable_lookups=False):
+                 convert_data=True, static_vars=None, cache=True, disable_lookups=False, path_to_variable=None):
         '''
         Templates (possibly recursively) any given data as input. If convert_bare is
         set to True, the given data will be wrapped as a jinja2 variable ('{{foo}}')
@@ -831,6 +895,16 @@ class Templar:
                 # we don't use iteritems() here to avoid problems if the underlying dict
                 # changes sizes due to the templating, which can happen with hostvars
                 for k in variable.keys():
+                    try:
+                        k_path_to_variable = "{0}.{1}".format(path_to_variable, k)
+                    except Exception:
+                        # Sometimes this fails for python2 because of weird UnicodeDecode/UnicodeEncode errors.
+                        # I can't figure out why it fails yet, probably some weird variable name.
+                        # But ansible seems to be dropping python2 support soon enough, so this problem doesn't seem
+                        # to be worth of investigation... unless we receive explicit bugreport.
+                        # This also does nothing for "regular" variable parsing, so only variables with "recursion"
+                        # are affected. And they didn't work anyway, even without this patch.
+                        k_path_to_variable = None
                     if k not in static_vars:
                         d[k] = self.template(
                             variable[k],
@@ -838,6 +912,7 @@ class Templar:
                             fail_on_undefined=fail_on_undefined,
                             overrides=overrides,
                             disable_lookups=disable_lookups,
+                            path_to_variable=k_path_to_variable,
                         )
                     else:
                         d[k] = variable[k]
@@ -1050,7 +1125,7 @@ class Templar:
 
             jvars = AnsibleJ2Vars(self, t.globals)
 
-            self.cur_context = new_context = t.new_context(jvars, shared=True)
+            self.cur_context = new_context = t.new_context(jvars, shared=True, locals=self._known_variables)
             rf = t.root_render_func(new_context)
 
             try:

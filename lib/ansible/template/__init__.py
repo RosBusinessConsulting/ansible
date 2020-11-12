@@ -1163,7 +1163,9 @@ class Templar:
             return res
         except (UndefinedError, AnsibleUndefinedVariable) as e:
             if fail_on_undefined:
-                raise AnsibleUndefinedVariable(e)
+                if isinstance(e, AnsibleUndefinedVariable):
+                    raise
+                raise AnsibleUndefinedVariable('Error while rendering template "{0}": "{1}"'.format(data, e))
             else:
                 display.debug("Ignoring undefined failure: %s" % to_text(e))
                 return data
